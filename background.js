@@ -1,4 +1,15 @@
-let tabStates = {}; // In-memory state tracking { tabId: { currentStep: 0, timerId: null, isExecuting: false } }
+let tabStates = {}; // In-memory state tracking { tabId: { currentStep: 0, iterations: 0, isExecuting: false } }
+
+// Load state from storage on startup to recover from service worker termination
+chrome.storage.local.get(['tabSimStates'], (data) => {
+    if (data.tabSimStates) {
+        tabStates = data.tabSimStates;
+        // Reset isExecuting status as any previous execution context is lost on restart
+        for (let tabId in tabStates) {
+            tabStates[tabId].isExecuting = false;
+        }
+    }
+});
 
 chrome.storage.onChanged.addListener((changes, namespace) => {
     if (namespace === 'local' && changes.tabConfigs) {
@@ -17,7 +28,7 @@ chrome.storage.onChanged.addListener((changes, namespace) => {
                 // Deactivated
                 stopSimulation(tabId);
             } else if (newConfig.active) {
-                // Config updated while active
+                // Config updated while active - restart with new config
                 stopSimulation(tabId);
                 startSimulation(tabId, newConfig);
             }
@@ -44,16 +55,34 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     });
 });
 
+// Handle Alarms
+chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name.startsWith('simulate_')) {
+        const tabId = parseInt(alarm.name.split('_')[1]);
+        chrome.storage.local.get(['tabConfigs'], (data) => {
+            const configs = data.tabConfigs || {};
+            const config = configs[tabId];
+            if (config && config.active) {
+                executeNextStep(tabId, config);
+            }
+        });
+    }
+});
+
+function saveTabStates() {
+    chrome.storage.local.set({ tabSimStates: tabStates });
+}
+
 function startSimulation(tabId, config) {
     if (!config || !config.steps || config.steps.length === 0) return;
     
     tabStates[tabId] = {
         currentStep: 0,
         iterations: 0,
-        timerId: null,
         isExecuting: false
     };
     
+    saveTabStates();
     updateTabStats(tabId, 0);
     
     executeNextStep(tabId, config);
@@ -68,32 +97,30 @@ function updateTabStats(tabId, iterations) {
 }
 
 function stopSimulation(tabId) {
+    chrome.alarms.clear(`simulate_${tabId}`);
     if (tabStates[tabId]) {
-        if (tabStates[tabId].timerId) {
-            clearTimeout(tabStates[tabId].timerId);
-        }
         delete tabStates[tabId];
+        saveTabStates();
     }
 }
 
 async function executeNextStep(tabId, config) {
     const state = tabStates[tabId];
     if (!state) return;
-    if (state.isExecuting) return; // Prevent concurrent execution
+    if (state.isExecuting) return; 
     
-    // Check if we reached the end
+    // Check if we reached the end of the step list
     if (state.currentStep >= config.steps.length) {
-        state.currentStep = 0; // Reset
+        state.currentStep = 0; // Reset to first step
         state.iterations++;
         updateTabStats(tabId, state.iterations);
-        
-        state.timerId = setTimeout(() => {
-            executeNextStep(tabId, config);
-        }, config.loopDelay * 1000);
-        return;
+        saveTabStates();
+        // The last step's delay was already handled by the alarm that triggered this call
     }
 
     state.isExecuting = true;
+    saveTabStates();
+
     const step = config.steps[state.currentStep];
 
     try {
@@ -109,7 +136,7 @@ async function executeNextStep(tabId, config) {
                 
                 chrome.tabs.update(tabId, { url: step.url }).catch((e) => {
                     chrome.tabs.onUpdated.removeListener(listener);
-                    resolve(); // Continue even on error
+                    resolve(); 
                 });
             });
         } else if (step.method === 'POST') {
@@ -119,7 +146,6 @@ async function executeNextStep(tabId, config) {
                     func: performFetch,
                     args: [step.url, step.body]
                 }, () => {
-                    // Resolve when fetch is complete
                     resolve();
                 });
             });
@@ -128,18 +154,24 @@ async function executeNextStep(tabId, config) {
         console.error("Step execution error:", err);
     }
 
-    // After completion, wait for the step delay
-    if (!tabStates[tabId]) return; // Check if stopped during execution
+    // Prepare for next step
+    if (!tabStates[tabId]) return; 
     
     state.isExecuting = false;
     state.currentStep++;
+    saveTabStates();
     
-    state.timerId = setTimeout(() => {
-        executeNextStep(tabId, config);
-    }, step.delay * 1000);
+    // Set alarm for the next step based on the CURRENT step's delay
+    // Note: If we just finished the last step, currentStep was incremented past the array length.
+    // We handle the loop reset at the START of the next executeNextStep call.
+    // The delay to respect is the one from the step we just performed.
+    const delayInMinutes = (step.delay || 1) / 60;
+    
+    chrome.alarms.create(`simulate_${tabId}`, {
+        delayInMinutes: delayInMinutes
+    });
 }
 
-// This function is injected into the page context
 async function performFetch(url, bodyText) {
     try {
         let options = {
